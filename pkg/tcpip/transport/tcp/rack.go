@@ -263,7 +263,7 @@ func (s *sender) probeTimerExpired() tcpip.Error {
 		}
 	}
 
-	s.postXmit(dataSent)
+	s.postXmit(dataSent, true /* probeSent */)
 	return nil
 }
 
@@ -479,5 +479,5 @@ func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 
 	// Rearm the RTO.
 	snd.resendTimer.enable(snd.rto)
-	snd.postXmit(dataSent)
+	snd.postXmit(dataSent, false /* probeSent */)
 }

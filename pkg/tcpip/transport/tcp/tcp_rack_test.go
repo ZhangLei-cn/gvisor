@@ -211,6 +211,267 @@ func addDSACKSeenCheckerProbe(t *testing.T, c *context.Context, numACK int, prob
 	})
 }
 
+// TestRACKTLPRecovery tests that RACK sends a tail loss probe (TLP) in the
+// case of a tail loss. This simulates a situation where the TLP is able to
+// insinuate the SACK holes and sender is able to retransmit the rest.
+func TestRACKTLPRecovery(t *testing.T) {
+	c := context.New(t, uint32(mtu))
+	defer c.Cleanup()
+
+	setStackSACKPermitted(t, c, true)
+	setStackRACKPermitted(t, c)
+
+	// Send 8 packets.
+	numPackets := 8
+	data := sendAndReceive(t, c, numPackets)
+
+	// Packets [6-8] are lost. Send cumulative ACK for [1-5].
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	bytesRead := 5 * maxPayload
+	c.SendAck(seq, bytesRead)
+
+	// PTO should fire and send #8 packet as a TLP.
+	c.ReceiveAndCheckPacketWithOptions(data, 7*maxPayload, maxPayload, tsOptionSize)
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("GetSockOpt failed: %v", err)
+	}
+
+	// Send the SACK after RTT because RACK RFC states that if the ACK for a
+	// retransmission arrives before the smoothed RTT then the sender should not
+	// update RACK state as it could be a spurious inference.
+	time.Sleep(info.RTT)
+
+	sackTime := time.Now()
+	// Okay, let the sender know we got #8 using a SACK block.
+	eighthPStart := c.IRS.Add(1 + seqnum.Size(7*maxPayload))
+	eighthPEnd := eighthPStart.Add(maxPayload)
+	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{eighthPStart, eighthPEnd}})
+
+	// The sender should be entering RACK based loss-recovery and sending #6 and
+	// #7 one after another.
+	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
+	firstRetransmit := time.Now()
+	bytesRead += maxPayload
+	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
+	bytesRead += 2 * maxPayload
+	c.SendAck(seq, bytesRead)
+
+	// Retransmission should be due to fast recovery (hence before RTO).
+	if !firstRetransmit.Before(sackTime.Add(info.RTO)) {
+		t.Errorf("TLP recovery took %s, should happen within a second", firstRetransmit.Sub(sackTime).String())
+	}
+
+	metricPollFn := func() error {
+		// One fast retransmit after the SACK.
+		if got, want := c.Stack().Stats().TCP.FastRetransmit.Value(), uint64(1); got != want {
+			return fmt.Errorf("got stats.TCP.FastRetransmit.Value = %d, want = %d", got, want)
+		}
+		// Packets 6, 7 and 8 were retransmitted.
+		if got, want := c.Stack().Stats().TCP.Retransmits.Value(), uint64(3); got != want {
+			return fmt.Errorf("got stats.TCP.Retransmits.Value = %d, want = %d", got, want)
+		}
+		// TLP recovery should have been detected.
+		if got, want := c.Stack().Stats().TCP.TLPRecovery.Value(), uint64(1); got != want {
+			return fmt.Errorf("got stats.TCP.TLPRecovery.Value = %d, want = %d", got, want)
+		}
+		return nil
+	}
+	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestRACKTLPFallbackRTO tests that RACK sends a tail loss probe (TLP) in the
+// case of a tail loss. This simulates a situation where either the TLP or its
+// ACK is lost. The sender should restrasmit when RTO fires.
+func TestRACKTLPFallbackRTO(t *testing.T) {
+	c := context.New(t, uint32(mtu))
+	defer c.Cleanup()
+
+	setStackSACKPermitted(t, c, true)
+	setStackRACKPermitted(t, c)
+
+	// Send 8 packets.
+	numPackets := 8
+	data := sendAndReceive(t, c, numPackets)
+
+	// Packets [6-8] are lost. Send cumulative ACK for [1-5].
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	bytesRead := 5 * maxPayload
+	c.SendAck(seq, bytesRead)
+
+	ackTime := time.Now()
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("GetSockOpt failed: %v", err)
+	}
+
+	// PTO should fire and send #8 packet as a TLP.
+	c.ReceiveAndCheckPacketWithOptions(data, 7*maxPayload, maxPayload, tsOptionSize)
+
+	// Either the TLP or the ACK the receiver sent with SACK blocks was lost.
+
+	// Confirm that RTO fires and retransmits packet #6.
+	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
+
+	// Check that it actually took RTO to retransmit.
+	if time.Now().Before(ackTime.Add(info.RTO)) {
+		t.Fatalf("retransmission occured before RTO")
+	}
+}
+
+// TestNoTLPRecoveryOnDSACK tests the scenario where the sender speculates a
+// tail loss and sends a TLP. Everything is received and acked. The probe
+// segment is DSACKed. No fast recovery should be triggered in this case.
+func TestNoTLPRecoveryOnDSACK(t *testing.T) {
+	c := context.New(t, uint32(mtu))
+	defer c.Cleanup()
+
+	setStackSACKPermitted(t, c, true)
+	setStackRACKPermitted(t, c)
+
+	// Send 8 packets.
+	numPackets := 8
+	data := sendAndReceive(t, c, numPackets)
+
+	// Packets [1-5] are received first. [6-8] took a detour and will take a
+	// while to arrive. Ack [1-5].
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	bytesRead := 5 * maxPayload
+	c.SendAck(seq, bytesRead)
+
+	// The tail loss probe (#8 packet) is received.
+	c.ReceiveAndCheckPacketWithOptions(data, 7*maxPayload, maxPayload, tsOptionSize)
+
+	// Now that all 8 packets are received + duplicate 8th packet, send ack.
+	bytesRead += 3 * maxPayload
+	eighthPStart := c.IRS.Add(1 + seqnum.Size(7*maxPayload))
+	eighthPEnd := eighthPStart.Add(maxPayload)
+	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{eighthPStart, eighthPEnd}})
+
+	// Wait for RTO and make sure that nothing else is received.
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("GetSockOpt failed: %v", err)
+	}
+	if p := c.GetPacketWithTimeout(info.RTO); p != nil {
+		t.Errorf("received an unexpected packet: %v", p)
+	}
+
+	metricPollFn := func() error {
+		// Make sure no recovery was entered.
+		if got, want := c.Stack().Stats().TCP.FastRetransmit.Value(), uint64(0); got != want {
+			return fmt.Errorf("got stats.TCP.FastRetransmit.Value = %d, want = %d", got, want)
+		}
+		if got, want := c.Stack().Stats().TCP.TLPRecovery.Value(), uint64(0); got != want {
+			return fmt.Errorf("got stats.TCP.TLPRecovery.Value = %d, want = %d", got, want)
+		}
+
+		// Packet #8 was retransmitted.
+		if got, want := c.Stack().Stats().TCP.Retransmits.Value(), uint64(1); got != want {
+			return fmt.Errorf("got stats.TCP.Retransmits.Value = %d, want = %d", got, want)
+		}
+
+		return nil
+	}
+	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestNoTLPOnSACK tests the scenario where there is not exactly a tail loss
+// due to the presence of multiple SACK holes. In such a scenario, TLP should
+// not be sent.
+func TestNoTLPOnSACK(t *testing.T) {
+	c := context.New(t, uint32(mtu))
+	defer c.Cleanup()
+
+	setStackSACKPermitted(t, c, true)
+	setStackRACKPermitted(t, c)
+
+	// Send 8 packets.
+	numPackets := 8
+	data := sendAndReceive(t, c, numPackets)
+
+	// Packets [1-5] and #7 were received. #6 and #8 were dropped.
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	bytesRead := 5 * maxPayload
+	seventhStart := c.IRS.Add(1 + seqnum.Size(6*maxPayload))
+	seventhEnd := seventhStart.Add(maxPayload)
+	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{seventhStart, seventhEnd}})
+
+	// The sender should retransmit #6. If a TLP is sent, #8 will be sent.
+	c.ReceiveAndCheckPacketWithOptions(data, 5*maxPayload, maxPayload, tsOptionSize)
+
+	metricPollFn := func() error {
+		// #6 was fast retransmitted.
+		if got, want := c.Stack().Stats().TCP.FastRetransmit.Value(), uint64(1); got != want {
+			return fmt.Errorf("got stats.TCP.FastRetransmit.Value = %d, want = %d", got, want)
+		}
+
+		// There were no TLPs.
+		if got, want := c.Stack().Stats().TCP.TLPRecovery.Value(), uint64(0); got != want {
+			return fmt.Errorf("got stats.TCP.TLPRecovery.Value = %d, want = %d", got, want)
+		}
+
+		// Packet #6 was retransmitted.
+		if got, want := c.Stack().Stats().TCP.Retransmits.Value(), uint64(1); got != want {
+			return fmt.Errorf("got stats.TCP.Retransmits.Value = %d, want = %d", got, want)
+		}
+
+		return nil
+	}
+	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestRACKOnePacketTailLoss tests the trivial case of a tail loss of only one
+// packet. The probe should itself repair the loss instead of having to go into
+// any recovery.
+func TestRACKOnePacketTailLoss(t *testing.T) {
+	c := context.New(t, uint32(mtu))
+	defer c.Cleanup()
+
+	setStackSACKPermitted(t, c, true)
+	setStackRACKPermitted(t, c)
+
+	// Send 3 packets.
+	numPackets := 3
+	data := sendAndReceive(t, c, numPackets)
+
+	// Packets [1-2] are received. #3 is lost.
+	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
+	bytesRead := 2 * maxPayload
+	c.SendAck(seq, bytesRead)
+
+	// PTO should fire and send #3 packet as a TLP.
+	c.ReceiveAndCheckPacketWithOptions(data, 2*maxPayload, maxPayload, tsOptionSize)
+	bytesRead += maxPayload
+	c.SendAck(seq, bytesRead)
+
+	metricPollFn := func() error {
+		// No fast recovery was every triggered.
+		if got, want := c.Stack().Stats().TCP.FastRetransmit.Value(), uint64(0); got != want {
+			return fmt.Errorf("got stats.TCP.FastRetransmit.Value = %d, want = %d", got, want)
+		}
+		if got, want := c.Stack().Stats().TCP.TLPRecovery.Value(), uint64(0); got != want {
+			return fmt.Errorf("got stats.TCP.TLPRecovery.Value = %d, want = %d", got, want)
+		}
+
+		// Packet #3 was retransmitted.
+		if got, want := c.Stack().Stats().TCP.Retransmits.Value(), uint64(1); got != want {
+			return fmt.Errorf("got stats.TCP.Retransmits.Value = %d, want = %d", got, want)
+		}
+
+		return nil
+	}
+	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
+		t.Error(err)
+	}
+}
+
 // TestRACKDetectDSACK tests that RACK detects DSACK with duplicate segments.
 // See: https://tools.ietf.org/html/rfc2883#section-4.1.1.
 func TestRACKDetectDSACK(t *testing.T) {
@@ -224,20 +485,22 @@ func TestRACKDetectDSACK(t *testing.T) {
 	numPackets := 8
 	data := sendAndReceive(t, c, numPackets)
 
-	// Cumulative ACK for [1-5] packets.
+	// Cumulative ACK for [1-5] packets and SACK #8 packet (to prevent TLP).
 	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	bytesRead := 5 * maxPayload
-	c.SendAck(seq, bytesRead)
+	eighthPStart := c.IRS.Add(1 + seqnum.Size(7*maxPayload))
+	eighthPEnd := eighthPStart.Add(maxPayload)
+	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{eighthPStart, eighthPEnd}})
 
-	// Expect retransmission of #6 packet.
+	// Expect retransmission of #6 packet after RTO expires.
 	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
 
 	// Send DSACK block for #6 packet indicating both
 	// initial and retransmitted packet are received and
-	// packets [1-7] are received.
-	start := c.IRS.Add(seqnum.Size(bytesRead))
+	// packets [1-8] are received.
+	start := c.IRS.Add(1 + seqnum.Size(bytesRead))
 	end := start.Add(maxPayload)
-	bytesRead += 2 * maxPayload
+	bytesRead += 3 * maxPayload
 	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{start, end}})
 
 	// Wait for the probe function to finish processing the
@@ -265,10 +528,12 @@ func TestRACKDetectDSACKWithOutOfOrder(t *testing.T) {
 	numPackets := 10
 	data := sendAndReceive(t, c, numPackets)
 
-	// Cumulative ACK for [1-5] packets.
+	// Cumulative ACK for [1-5] packets and SACK for #7 packet (to prevent TLP).
 	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	bytesRead := 5 * maxPayload
-	c.SendAck(seq, bytesRead)
+	seventhPStart := c.IRS.Add(1 + seqnum.Size(6*maxPayload))
+	seventhPEnd := seventhPStart.Add(maxPayload)
+	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{seventhPStart, seventhPEnd}})
 
 	// Expect retransmission of #6 packet.
 	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
@@ -276,12 +541,12 @@ func TestRACKDetectDSACKWithOutOfOrder(t *testing.T) {
 	// Send DSACK block for #6 packet indicating both
 	// initial and retransmitted packet are received and
 	// packets [1-7] are received.
-	start := c.IRS.Add(seqnum.Size(bytesRead))
+	start := c.IRS.Add(1 + seqnum.Size(bytesRead))
 	end := start.Add(maxPayload)
 	bytesRead += 2 * maxPayload
-	// Send DSACK block for #6 along with out of
-	// order #9 packet is received.
-	start1 := c.IRS.Add(seqnum.Size(bytesRead) + maxPayload)
+	// Send DSACK block for #6 along with SACK for out of
+	// order #9 packet.
+	start1 := c.IRS.Add(1 + seqnum.Size(bytesRead) + maxPayload)
 	end1 := start1.Add(maxPayload)
 	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{start, end}, {start1, end1}})
 
@@ -525,10 +790,12 @@ func TestRACKWithInvalidDSACKBlock(t *testing.T) {
 	numPackets := 10
 	data := sendAndReceive(t, c, numPackets)
 
-	// Cumulative ACK for [1-5] packets.
+	// Cumulative ACK for [1-5] packets and SACK for #7 packet (to prevent TLP).
 	seq := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	bytesRead := 5 * maxPayload
-	c.SendAck(seq, bytesRead)
+	seventhPStart := c.IRS.Add(1 + seqnum.Size(6*maxPayload))
+	seventhPEnd := seventhPStart.Add(maxPayload)
+	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{seventhPStart, seventhPEnd}})
 
 	// Expect retransmission of #6 packet.
 	c.ReceiveAndCheckPacketWithOptions(data, bytesRead, maxPayload, tsOptionSize)
@@ -536,12 +803,12 @@ func TestRACKWithInvalidDSACKBlock(t *testing.T) {
 	// Send DSACK block for #6 packet indicating both
 	// initial and retransmitted packet are received and
 	// packets [1-7] are received.
-	start := c.IRS.Add(seqnum.Size(bytesRead))
+	start := c.IRS.Add(1 + seqnum.Size(bytesRead))
 	end := start.Add(maxPayload)
 	bytesRead += 2 * maxPayload
 
-	// Send DSACK block as second block.
-	start1 := c.IRS.Add(seqnum.Size(bytesRead) + maxPayload)
+	// Send DSACK block as second block. The first block is a SACK for #9 packet.
+	start1 := c.IRS.Add(1 + seqnum.Size(bytesRead) + maxPayload)
 	end1 := start1.Add(maxPayload)
 	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{start1, end1}, {start, end}})
 

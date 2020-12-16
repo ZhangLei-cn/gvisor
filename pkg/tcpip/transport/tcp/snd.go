@@ -966,7 +966,7 @@ func (s *sender) disableZeroWindowProbing() {
 	s.resendTimer.disable()
 }
 
-func (s *sender) postXmit(dataSent bool) {
+func (s *sender) postXmit(dataSent bool, probeSent bool) {
 	if dataSent {
 		// We sent data, so we should stop the keepalive timer to ensure
 		// that no keepalives are sent while there is pending data.
@@ -980,13 +980,19 @@ func (s *sender) postXmit(dataSent bool) {
 		s.enableZeroWindowProbing()
 	}
 
-	// Enable the timer if we have pending data and it's not enabled yet.
-	if !s.resendTimer.enabled() && s.sndUna != s.sndNxt {
-		s.resendTimer.enable(s.rto)
-	}
 	// If we have no more pending data, start the keepalive timer.
 	if s.sndUna == s.sndNxt {
 		s.ep.resetKeepaliveTimer(false)
+	} else {
+		// Enable timers if we have pending data.
+		if !probeSent && s.shouldSchedulePTO() {
+			// Schedule PTO after transmitting new data that wasn't itself a TLP probe.
+			s.schedulePTO()
+		} else if !s.resendTimer.enabled() {
+			// Enable the timer if it's not enabled yet.
+			s.probeTimer.disable()
+			s.resendTimer.enable(s.rto)
+		}
 	}
 }
 
@@ -1029,7 +1035,7 @@ func (s *sender) sendData() {
 		s.writeNext = seg.Next()
 	}
 
-	s.postXmit(dataSent)
+	s.postXmit(dataSent, false /* probeSent */)
 }
 
 func (s *sender) enterRecovery() {
@@ -1051,6 +1057,10 @@ func (s *sender) enterRecovery() {
 		s.ep.stack.Stats().TCP.SACKRecovery.Increment()
 		// Set TLPRxtOut to false according to
 		// https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.6.1.
+		if s.rc.tlpRxtOut {
+			// The tail loss probe triggered recovery.
+			s.ep.stack.Stats().TCP.TLPRecovery.Increment()
+		}
 		s.rc.tlpRxtOut = false
 		return
 	}
@@ -1403,9 +1413,16 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			s.updateRTO(elapsed)
 		}
 
-		// When an ack is received we must rearm the timer.
-		// RFC 6298 5.3
-		s.resendTimer.enable(s.rto)
+		if s.shouldSchedulePTO() {
+			// Schedule PTO upon receiving an ACK that cumulatively acknowledges data.
+			// See https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.5.1.
+			s.schedulePTO()
+		} else {
+			// When an ack is received we must rearm the timer.
+			// RFC 6298 5.3
+			s.probeTimer.disable()
+			s.resendTimer.enable(s.rto)
+		}
 
 		// Remove all acknowledged data from the write list.
 		acked := s.sndUna.Size(ack)
