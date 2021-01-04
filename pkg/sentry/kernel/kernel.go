@@ -116,7 +116,7 @@ type Kernel struct {
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
-	featureSet                  *cpuid.FeatureSet
+	featureSet                  cpuid.FeatureSet
 	timekeeper                  *Timekeeper
 	tasks                       *TaskSet
 	rootUserNamespace           *auth.UserNamespace
@@ -287,7 +287,7 @@ type Kernel struct {
 // InitKernelArgs holds arguments to Init.
 type InitKernelArgs struct {
 	// FeatureSet is the emulated CPU feature set.
-	FeatureSet *cpuid.FeatureSet
+	FeatureSet cpuid.FeatureSet
 
 	// Timekeeper manages time for all tasks in the system.
 	Timekeeper *Timekeeper
@@ -336,9 +336,6 @@ type InitKernelArgs struct {
 // Callers must manually set Kernel.Platform and call Kernel.SetMemoryFile
 // before calling Init.
 func (k *Kernel) Init(args InitKernelArgs) error {
-	if args.FeatureSet == nil {
-		return fmt.Errorf("FeatureSet is nil")
-	}
 	if args.Timekeeper == nil {
 		return fmt.Errorf("Timekeeper is nil")
 	}
@@ -1379,7 +1376,7 @@ func (k *Kernel) RebuildTraceContexts() {
 }
 
 // FeatureSet returns the FeatureSet.
-func (k *Kernel) FeatureSet() *cpuid.FeatureSet {
+func (k *Kernel) FeatureSet() cpuid.FeatureSet {
 	return k.featureSet
 }
 
