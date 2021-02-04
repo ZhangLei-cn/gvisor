@@ -38,7 +38,8 @@ type NeighborEntry struct {
 }
 
 // NeighborState defines the state of a NeighborEntry within the Neighbor
-// Unreachability Detection state machine, as per RFC 4861 section 7.3.2.
+// Unreachability Detection state machine, as per RFC 4861 section 7.3.2 and
+// RFC 7048.
 type NeighborState uint8
 
 const (
@@ -66,8 +67,8 @@ const (
 	// Static describes entries that have been explicitly added by the user. They
 	// do not expire and are not deleted until explicitly removed.
 	Static
-	// Failed means recent attempts of reachability have returned inconclusive.
-	Failed
+	// Unreachable means recent attempts of reachability have returned inconclusive.
+	Unreachable
 )
 
 // neighborEntry implements a neighbor entry's individual node behavior, as per
@@ -244,14 +245,14 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 
 		sendUnicastProbe = func() {
 			if retryCounter == config.MaxUnicastProbes {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.setStateLocked(Unreachable)
+				e.dispatchChangeEventLocked()
 				return
 			}
 
 			if err := e.cache.linkRes.LinkAddressRequest(e.neigh.Addr, "" /* localAddr */, e.neigh.LinkAddr); err != nil {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.setStateLocked(Unreachable)
+				e.dispatchChangeEventLocked()
 				return
 			}
 
@@ -267,7 +268,7 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 		e.job = e.cache.nic.stack.newJob(&e.mu, sendUnicastProbe)
 		e.job.Schedule(immediateDuration)
 
-	case Failed:
+	case Unreachable:
 		e.notifyCompletionLocked(false /* succeeded */)
 
 	case Unknown, Stale, Static:
@@ -286,15 +287,17 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 // Precondition: e.mu MUST be locked.
 func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 	switch e.neigh.State {
-	case Failed:
-		e.cache.nic.stats.Neighbor.FailedEntryLookups.Increment()
-
-		fallthrough
-	case Unknown:
+	case Unknown, Unreachable:
+		prev := e.neigh.State
 		e.neigh.State = Incomplete
 		e.neigh.UpdatedAtNanos = e.cache.nic.stack.clock.NowNanoseconds()
 
-		e.dispatchAddEventLocked()
+		if prev == Unknown {
+			e.dispatchAddEventLocked()
+		} else if prev == Unreachable {
+			e.dispatchChangeEventLocked()
+			e.cache.nic.stats.Neighbor.FailedEntryLookups.Increment()
+		}
 
 		config := e.nudState.Config()
 
@@ -323,8 +326,8 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 				// to the sender by taking the offending packet, generating an ICMP
 				// error message, and then delivering it (locally) through the generic
 				// error-handling routines." - RFC 4861 section 2.1
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.setStateLocked(Unreachable)
+				e.dispatchChangeEventLocked()
 				return
 			}
 
@@ -339,8 +342,8 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 				// There is no need to log the error here; the NUD implementation may
 				// assume a working link. A valid link should be the responsibility of
 				// the NIC/stack.LinkEndpoint.
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.setStateLocked(Unreachable)
+				e.dispatchChangeEventLocked()
 				return
 			}
 
@@ -379,7 +382,7 @@ func (e *neighborEntry) handleProbeLocked(remoteLinkAddr tcpip.LinkAddress) {
 	// checks MUST be done by the NetworkEndpoint.
 
 	switch e.neigh.State {
-	case Unknown, Failed:
+	case Unknown, Unreachable:
 		e.neigh.LinkAddr = remoteLinkAddr
 		e.setStateLocked(Stale)
 		e.dispatchAddEventLocked()
@@ -510,7 +513,7 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 		}
 		e.isRouter = flags.IsRouter
 
-	case Unknown, Failed, Static:
+	case Unknown, Unreachable, Static:
 		// Do nothing
 
 	default:
@@ -532,7 +535,7 @@ func (e *neighborEntry) handleUpperLevelConfirmationLocked() {
 			e.dispatchChangeEventLocked()
 		}
 
-	case Unknown, Incomplete, Failed, Static:
+	case Unknown, Incomplete, Unreachable, Static:
 		// Do nothing
 
 	default:

@@ -70,38 +70,38 @@ func eventDiffOptsWithSort() []cmp.Option {
 }
 
 // The following unit tests exercise every state transition and verify its
-// behavior with RFC 4681.
+// behavior with RFC 4681 and RFC 7048.
 //
-// | From       | To         | Cause                                      | Update   | Action     | Event   |
-// | ========== | ========== | ========================================== | ======== | ===========| ======= |
-// | Unknown    | Unknown    | Confirmation w/ unknown address            |          |            | Added   |
-// | Unknown    | Incomplete | Packet queued to unknown address           |          | Send probe | Added   |
-// | Unknown    | Stale      | Probe                                      |          |            | Added   |
-// | Incomplete | Incomplete | Retransmit timer expired                   |          | Send probe | Changed |
-// | Incomplete | Reachable  | Solicited confirmation                     | LinkAddr | Notify     | Changed |
-// | Incomplete | Stale      | Unsolicited confirmation                   | LinkAddr | Notify     | Changed |
-// | Incomplete | Stale      | Probe                                      | LinkAddr | Notify     | Changed |
-// | Incomplete | Failed     | Max probes sent without reply              |          | Notify     | Removed |
-// | Reachable  | Reachable  | Confirmation w/ different isRouter flag    | IsRouter |            |         |
-// | Reachable  | Stale      | Reachable timer expired                    |          |            | Changed |
-// | Reachable  | Stale      | Probe or confirmation w/ different address |          |            | Changed |
-// | Stale      | Reachable  | Solicited override confirmation            | LinkAddr |            | Changed |
-// | Stale      | Reachable  | Solicited confirmation w/o address         |          | Notify     | Changed |
-// | Stale      | Stale      | Override confirmation                      | LinkAddr |            | Changed |
-// | Stale      | Stale      | Probe w/ different address                 | LinkAddr |            | Changed |
-// | Stale      | Delay      | Packet sent                                |          |            | Changed |
-// | Delay      | Reachable  | Upper-layer confirmation                   |          |            | Changed |
-// | Delay      | Reachable  | Solicited override confirmation            | LinkAddr |            | Changed |
-// | Delay      | Reachable  | Solicited confirmation w/o address         |          | Notify     | Changed |
-// | Delay      | Stale      | Probe or confirmation w/ different address |          |            | Changed |
-// | Delay      | Probe      | Delay timer expired                        |          | Send probe | Changed |
-// | Probe      | Reachable  | Solicited override confirmation            | LinkAddr |            | Changed |
-// | Probe      | Reachable  | Solicited confirmation w/ same address     |          | Notify     | Changed |
-// | Probe      | Reachable  | Solicited confirmation w/o address         |          | Notify     | Changed |
-// | Probe      | Stale      | Probe or confirmation w/ different address |          |            | Changed |
-// | Probe      | Probe      | Retransmit timer expired                   |          |            | Changed |
-// | Probe      | Failed     | Max probes sent without reply              |          | Notify     | Removed |
-// | Failed     | Incomplete | Packet queued                              |          | Send probe | Added   |
+// | From        | To          | Cause                                      | Update   | Action     | Event   |
+// | =========== | =========== | ========================================== | ======== | ===========| ======= |
+// | Unknown     | Unknown     | Confirmation w/ unknown address            |          |            | Added   |
+// | Unknown     | Incomplete  | Packet queued to unknown address           |          | Send probe | Added   |
+// | Unknown     | Stale       | Probe                                      |          |            | Added   |
+// | Incomplete  | Incomplete  | Retransmit timer expired                   |          | Send probe | Changed |
+// | Incomplete  | Reachable   | Solicited confirmation                     | LinkAddr | Notify     | Changed |
+// | Incomplete  | Stale       | Unsolicited confirmation                   | LinkAddr | Notify     | Changed |
+// | Incomplete  | Stale       | Probe                                      | LinkAddr | Notify     | Changed |
+// | Incomplete  | Unreachable | Max probes sent without reply              |          | Notify     | Changed |
+// | Reachable   | Reachable   | Confirmation w/ different isRouter flag    | IsRouter |            |         |
+// | Reachable   | Stale       | Reachable timer expired                    |          |            | Changed |
+// | Reachable   | Stale       | Probe or confirmation w/ different address |          |            | Changed |
+// | Stale       | Reachable   | Solicited override confirmation            | LinkAddr |            | Changed |
+// | Stale       | Reachable   | Solicited confirmation w/o address         |          | Notify     | Changed |
+// | Stale       | Stale       | Override confirmation                      | LinkAddr |            | Changed |
+// | Stale       | Stale       | Probe w/ different address                 | LinkAddr |            | Changed |
+// | Stale       | Delay       | Packet sent                                |          |            | Changed |
+// | Delay       | Reachable   | Upper-layer confirmation                   |          |            | Changed |
+// | Delay       | Reachable   | Solicited override confirmation            | LinkAddr |            | Changed |
+// | Delay       | Reachable   | Solicited confirmation w/o address         |          | Notify     | Changed |
+// | Delay       | Stale       | Probe or confirmation w/ different address |          |            | Changed |
+// | Delay       | Probe       | Delay timer expired                        |          | Send probe | Changed |
+// | Probe       | Reachable   | Solicited override confirmation            | LinkAddr |            | Changed |
+// | Probe       | Reachable   | Solicited confirmation w/ same address     |          | Notify     | Changed |
+// | Probe       | Reachable   | Solicited confirmation w/o address         |          | Notify     | Changed |
+// | Probe       | Stale       | Probe or confirmation w/ different address |          |            | Changed |
+// | Probe       | Probe       | Retransmit timer expired                   |          |            | Changed |
+// | Probe       | Unreachable | Max probes sent without reply              |          | Notify     | Changed |
+// | Unreachable | Incomplete  | Packet queued                              |          | Send probe | Added   |
 
 type testEntryEventType uint8
 
@@ -451,7 +451,7 @@ func TestEntryIncompleteToIncompleteDoesNotChangeUpdatedAt(t *testing.T) {
 	clock.Advance(c.RetransmitTimer)
 
 	// UpdatedAt should change after failing address resolution. Timing out after
-	// sending the last probe transitions the entry to Failed.
+	// sending the last probe transitions the entry to Unreachable.
 	{
 		wantProbes := []entryTestProbeInfo{
 			{
@@ -481,12 +481,12 @@ func TestEntryIncompleteToIncompleteDoesNotChangeUpdatedAt(t *testing.T) {
 			},
 		},
 		{
-			EventType: entryTestRemoved,
+			EventType: entryTestChanged,
 			NICID:     entryTestNICID,
 			Entry: NeighborEntry{
 				Addr:     entryTestAddr1,
 				LinkAddr: tcpip.LinkAddress(""),
-				State:    Incomplete,
+				State:    Unreachable,
 			},
 		},
 	}
@@ -758,7 +758,7 @@ func TestEntryIncompleteToStaleWhenProbe(t *testing.T) {
 	nudDisp.mu.Unlock()
 }
 
-func TestEntryIncompleteToFailed(t *testing.T) {
+func TestEntryIncompleteToUnreachable(t *testing.T) {
 	c := DefaultNUDConfigurations()
 	c.MaxMulticastProbes = 3
 	e, nudDisp, linkRes, clock := entryTestSetup(c)
@@ -810,12 +810,12 @@ func TestEntryIncompleteToFailed(t *testing.T) {
 			},
 		},
 		{
-			EventType: entryTestRemoved,
+			EventType: entryTestChanged,
 			NICID:     entryTestNICID,
 			Entry: NeighborEntry{
 				Addr:     entryTestAddr1,
 				LinkAddr: tcpip.LinkAddress(""),
-				State:    Incomplete,
+				State:    Unreachable,
 			},
 		},
 	}
@@ -826,8 +826,8 @@ func TestEntryIncompleteToFailed(t *testing.T) {
 	nudDisp.mu.Unlock()
 
 	e.mu.Lock()
-	if e.neigh.State != Failed {
-		t.Errorf("got e.neigh.State = %q, want = %q", e.neigh.State, Failed)
+	if e.neigh.State != Unreachable {
+		t.Errorf("got e.neigh.State = %q, want = %q", e.neigh.State, Unreachable)
 	}
 	e.mu.Unlock()
 }
@@ -3297,7 +3297,7 @@ func TestEntryProbeToReachableWhenSolicitedConfirmationWithoutAddress(t *testing
 	nudDisp.mu.Unlock()
 }
 
-func TestEntryProbeToFailed(t *testing.T) {
+func TestEntryProbeToUnreachable(t *testing.T) {
 	c := DefaultNUDConfigurations()
 	c.MaxMulticastProbes = 3
 	c.MaxUnicastProbes = 3
@@ -3358,11 +3358,11 @@ func TestEntryProbeToFailed(t *testing.T) {
 		e.mu.Unlock()
 	}
 
-	// Wait for the last probe to expire, causing a transition to Failed.
+	// Wait for the last probe to expire, causing a transition to Unreachable.
 	clock.Advance(c.RetransmitTimer)
 	e.mu.Lock()
-	if e.neigh.State != Failed {
-		t.Errorf("got e.neigh.State = %q, want = %q", e.neigh.State, Failed)
+	if e.neigh.State != Unreachable {
+		t.Errorf("got e.neigh.State = %q, want = %q", e.neigh.State, Unreachable)
 	}
 	e.mu.Unlock()
 
@@ -3404,12 +3404,12 @@ func TestEntryProbeToFailed(t *testing.T) {
 			},
 		},
 		{
-			EventType: entryTestRemoved,
+			EventType: entryTestChanged,
 			NICID:     entryTestNICID,
 			Entry: NeighborEntry{
 				Addr:     entryTestAddr1,
 				LinkAddr: entryTestLinkAddr1,
-				State:    Probe,
+				State:    Unreachable,
 			},
 		},
 	}
@@ -3420,7 +3420,7 @@ func TestEntryProbeToFailed(t *testing.T) {
 	nudDisp.mu.Unlock()
 }
 
-func TestEntryFailedToIncomplete(t *testing.T) {
+func TestEntryUnreachableToIncomplete(t *testing.T) {
 	c := DefaultNUDConfigurations()
 	c.MaxMulticastProbes = 3
 	e, nudDisp, linkRes, clock := entryTestSetup(c)
@@ -3464,8 +3464,8 @@ func TestEntryFailedToIncomplete(t *testing.T) {
 	}
 
 	e.mu.Lock()
-	if e.neigh.State != Failed {
-		t.Errorf("got e.neigh.State = %q, want = %q", e.neigh.State, Failed)
+	if e.neigh.State != Unreachable {
+		t.Errorf("got e.neigh.State = %q, want = %q", e.neigh.State, Unreachable)
 	}
 	e.mu.Unlock()
 
@@ -3487,16 +3487,16 @@ func TestEntryFailedToIncomplete(t *testing.T) {
 			},
 		},
 		{
-			EventType: entryTestRemoved,
+			EventType: entryTestChanged,
 			NICID:     entryTestNICID,
 			Entry: NeighborEntry{
 				Addr:     entryTestAddr1,
 				LinkAddr: tcpip.LinkAddress(""),
-				State:    Incomplete,
+				State:    Unreachable,
 			},
 		},
 		{
-			EventType: entryTestAdded,
+			EventType: entryTestChanged,
 			NICID:     entryTestNICID,
 			Entry: NeighborEntry{
 				Addr:     entryTestAddr1,
