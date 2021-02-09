@@ -98,6 +98,26 @@ TEST_P(AllSocketPairTest, BasicSendmmsg) {
   EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
 }
 
+TEST_P(AllSocketPairTest, SendmmsgIsLimitedByMAXIOV) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+  char c = 0;
+
+  std::vector<struct mmsghdr> msgs(UIO_MAXIOV + 1);
+  std::vector<struct iovec> iovs(msgs.size());
+  for (size_t i = 0; i < msgs.size(); i++) {
+    iovs[i].iov_len = 1;
+    iovs[i].iov_base = &c;
+    msgs[i].msg_hdr.msg_iov = &iovs[i];
+    msgs[i].msg_hdr.msg_iovlen = 1;
+  }
+
+  int n;
+  ASSERT_THAT(n = RetryEINTR(sendmmsg)(sockets->first_fd(), &msgs[0],
+                                       msgs.size(), MSG_DONTWAIT),
+              SyscallSucceeds());
+  EXPECT_LE(n, UIO_MAXIOV);
+}
+
 TEST_P(AllSocketPairTest, BasicRecvmmsg) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
   char sent_data[200];
